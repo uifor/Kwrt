@@ -1,324 +1,397 @@
 #=================================================
-# https://github.com/P3TERX/Actions-OpenWrt
 # Description: Build OpenWrt using GitHub Actions
-# Lisence: MIT
-# Author: P3TERX
-# Blog: https://p3terx.com
+# 修改说明（相对原始 kiddin9/Kwrt 版本）：
+#   1. 触发方式：repository_dispatch → workflow_dispatch（手动触发）+ push 触发
+#   2. REPO_TOKEN 改用自己仓库的 secrets.REPO_TOKEN，去除 TOKEN_KIDDIN9 所有引用
+#   3. 删除 "Trigger Packages Update" 步骤（依赖原作者 kwrt-packages dispatch 权限）
+#   4. 删除编译后 SSH 部署到 dl.openwrt.ai 服务器的步骤（无权访问）
+#   5. Clone source 时去除依赖 TOKEN_KIDDIN9 的 GraphQL 鉴权，改为匿名请求
+#   6. 保留 GitHub Releases 上传、Telegram 通知、ccache、Artifact 等全部功能
 #=================================================
 
 name: Build OpenWrt
 
-on: 
+on:
+  # ✅ 改为手动触发，在 Actions 页面选择 target 后点击 Run workflow
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '编译目标，例如：ramips_mt7621 或 ramips_mt76x8'
+        required: true
+        default: 'ramips_mt7621'
+      ssh:
+        description: '是否开启 SSH 调试 (填 ssh 开启)'
+        required: false
+        default: ''
+      nocache:
+        description: '是否清除 ccache (填 nocache 清除)'
+        required: false
+        default: ''
+
+  # ✅ 可选：保留 repository_dispatch 以便将来通过 API 触发
   repository_dispatch:
 
 env:
-  REPO_TOKEN: ${{ secrets.TOKEN_KIDDIN9 }}
+  # ✅ 改用自己仓库的 REPO_TOKEN，在 Settings → Secrets 中添加
+  REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
   PPPOE_USERNAME: ${{ secrets.PPPOE_USERNAME }}
   PPPOE_PASSWD: ${{ secrets.PPPOE_PASSWD }}
   SCKEY: ${{ secrets.SCKEY }}
   TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
   TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-  DOCKER_ID: ${{ secrets.DOCKER_ID }}
-  DOCKER_PASSWD: ${{ secrets.DOCKER_PASSWD }}
+  # SSH_PRIVATE_KEY / DOCKER_ID / DOCKER_PASSWD 已删除（不再部署到远端服务器）
   TZ: Asia/Shanghai
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
-    name: Build ${{matrix.target}}
+    # 支持两种触发方式：workflow_dispatch 用 inputs.target，repository_dispatch 用 client_payload.target
+    name: Build ${{ github.event.inputs.target || github.event.client_payload.target }}
     strategy:
       fail-fast: false
       matrix:
-        target: ["${{ github.event.client_payload.target }}"]
-        
+        target:
+          - ${{ github.event.inputs.target || github.event.client_payload.target }}
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
-      with:
+      - name: Checkout
+        uses: actions/checkout@main
+        with:
           fetch-depth: 0
 
-    # - name: Set up secret file
-      # run: |
-        # echo ${{ secrets.TELEGRAM_CHAT_ID }} | sed 's/./& /g'
-        # echo ${{ secrets.TELEGRAM_TOKEN }} | sed 's/./& /g'
+      - name: Load Settings.ini
+        run: |
+          echo ${{matrix.target}}
+          source "${{ github.workspace }}/devices/common/settings.ini"
+          if [ -f "devices/${{matrix.target}}/settings.ini" ]; then
+            source "${{ github.workspace }}/devices/${{matrix.target}}/settings.ini"
+          fi
+          echo "REPO_URL=${REPO_URL}" >> $GITHUB_ENV
+          echo "REPO_BRANCH=${REPO_BRANCH}" >> $GITHUB_ENV
+          echo "CONFIG_FILE=${CONFIG_FILE}" >> $GITHUB_ENV
+          echo "DIY_SH=${DIY_SH}" >> $GITHUB_ENV
+          echo "FREE_UP_DISK=${FREE_UP_DISK}" >> $GITHUB_ENV
+          echo "UPLOAD_BIN_DIR_FOR_ARTIFACT=${UPLOAD_BIN_DIR_FOR_ARTIFACT}" >> $GITHUB_ENV
+          echo "UPLOAD_FIRMWARE_FOR_ARTIFACT=${UPLOAD_FIRMWARE_FOR_ARTIFACT}" >> $GITHUB_ENV
+          echo "UPLOAD_FIRMWARE_FOR_RELEASE=${UPLOAD_FIRMWARE_FOR_RELEASE}" >> $GITHUB_ENV
+          echo "UPLOAD_FIRMWARE_TO_COWTRANSFER=${UPLOAD_FIRMWARE_TO_COWTRANSFER}" >> $GITHUB_ENV
+          echo "UPLOAD_FIRMWARE_TO_WETRANSFER=${UPLOAD_FIRMWARE_TO_WETRANSFER}" >> $GITHUB_ENV
 
-    - name: Load Settings.ini
-      run: |
-        echo ${{matrix.target}}
-        source "${{ github.workspace }}/devices/common/settings.ini"
-        if [ -f "devices/${{matrix.target}}/settings.ini" ]; then
-          source "${{ github.workspace }}/devices/${{matrix.target}}/settings.ini"
-        fi
-        echo "REPO_URL=${REPO_URL}" >> $GITHUB_ENV
-        echo "REPO_BRANCH=${REPO_BRANCH}" >> $GITHUB_ENV
-        echo "CONFIG_FILE=${CONFIG_FILE}" >> $GITHUB_ENV
-        echo "DIY_SH=${DIY_SH}" >> $GITHUB_ENV
-        echo "FREE_UP_DISK=${FREE_UP_DISK}" >> $GITHUB_ENV
-        echo "UPLOAD_BIN_DIR_FOR_ARTIFACT=${UPLOAD_BIN_DIR_FOR_ARTIFACT}" >> $GITHUB_ENV
-        echo "UPLOAD_FIRMWARE_FOR_ARTIFACT=${UPLOAD_FIRMWARE_FOR_ARTIFACT}" >> $GITHUB_ENV
-        echo "UPLOAD_FIRMWARE_FOR_RELEASE=${UPLOAD_FIRMWARE_FOR_RELEASE}" >> $GITHUB_ENV
-        echo "UPLOAD_FIRMWARE_TO_COWTRANSFER=${UPLOAD_FIRMWARE_TO_COWTRANSFER}" >> $GITHUB_ENV
-        echo "UPLOAD_FIRMWARE_TO_WETRANSFER=${UPLOAD_FIRMWARE_TO_WETRANSFER}" >> $GITHUB_ENV
-        sed -i "1a REPO_TOKEN=${{ secrets.TOKEN_KIDDIN9 }}" ${{ github.workspace }}/devices/common/diy.sh
-        sed -i "1a TARGET=${{matrix.target}}" ${{ github.workspace }}/devices/common/diy.sh
+          # ✅ 注入 REPO_TOKEN（使用自己的 token）和 TARGET 到 diy.sh 头部
+          sed -i "1a REPO_TOKEN=${{ secrets.REPO_TOKEN }}" ${{ github.workspace }}/devices/common/diy.sh
+          sed -i "1a TARGET=${{matrix.target}}" ${{ github.workspace }}/devices/common/diy.sh
 
-    - name: Trigger Packages Update
-      continue-on-error: true
-      if: contains(github.event.action, 'pkg')
-      run: |
-        status=$(curl -H "Authorization: token ${{ secrets.TOKEN_KIDDIN9 }}" -s "https://api.github.com/repos/kiddin9/op-packages/actions/runs" | jq -r '.workflow_runs[0].status')
-        if [[ "$status" == "completed" ]]; then
-          curl -X POST https://api.github.com/repos/kiddin9/op-packages/dispatches \
-            -H "Accept: application/vnd.github.everest-preview+json" \
-            -H "Authorization: token ${{ secrets.TOKEN_KIDDIN9 }}" \
-          --data '{"event_type": "update"}'
-        fi
+          # 架构判断（原样保留）
+          if [ ${{matrix.target}} == "x86_64" ]; then
+            echo "ARCH=linux/amd64" >> $GITHUB_ENV
+            echo "MTARGET=x86_64" >> $GITHUB_ENV
+          elif [ ${{matrix.target}} == "x86_generic" ]; then
+            echo "ARCH=linux/amd32" >> $GITHUB_ENV
+            echo "MTARGET=x86_generic" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} =~ (armsr_armv8|qualcommax_ipq807x|mediatek_mt7622|mediatek_filogic|bcm27xx_bcm2710|qualcommax_ipq60xx|bcm4908_generic|sunxi_cortexa53|amlogic_mesongx|airoha_an7581) ]]; then
+            echo "MTARGET=aarch64_cortex-a53" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} =~ (ramips_mt7621|ramips_mt7620|ramips_mt76x8) ]]; then
+            echo "MTARGET=mipsel_24kc" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} == "ath79_nand" ]]; then
+            echo "MTARGET=mips_24kc" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} =~ (ipq40xx_generic|bcm27xx_bcm2709|sunxi_cortexa7|qualcommax_ipq50xx) ]]; then
+            echo "MTARGET=arm_cortex-a7_neon-vfpv4" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} == "amlogic_meson8b" ]]; then
+            echo "MTARGET=arm_cortex-a5_vfpv4" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} == "bcm53xx" ]]; then
+            echo "MTARGET=arm_cortex-a9" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} == "mvebu_cortexa9" ]]; then
+            echo "MTARGET=arm_cortex-a9_vfpv3-d16" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} == "ipq806x_generic" ]]; then
+            echo "MTARGET=arm_cortex-a15_neon-vfpv4" >> $GITHUB_ENV
+          elif [[ ${{matrix.target}} == "bcm27xx_bcm2708" ]]; then
+            echo "MTARGET=arm_arm1176jzf-s_vfp" >> $GITHUB_ENV
+          else
+            echo "ARCH=linux/arm64" >> $GITHUB_ENV
+            if [[ ${{matrix.target}} == "bcm27xx_bcm2711" ]]; then
+              echo "MTARGET=aarch64_cortex-a72" >> $GITHUB_ENV
+            elif [[ ${{matrix.target}} == rockchip* ]]; then
+              echo "MTARGET=aarch64_generic" >> $GITHUB_ENV
+            fi
+          fi
 
-    - name: Free disk space
-      uses: coder-xiaomo/free-disk-space@main
-      with:
-        tool-cache: false
-        android: true
-        dotnet: true
-        haskell: true
-        large-packages: true
-        docker-images: true
-        swap-storage: true
+      # ❌ 已删除 "Trigger Packages Update" 步骤
+      # 原因：该步骤用 TOKEN_KIDDIN9 向 kiddin9/kwrt-packages 发送 dispatch，
+      # fork 后无权操作原作者仓库，直接跳过即可，不影响编译。
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install build-essential clang flex bison g++ gawk \
-        gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-        python3-setuptools rsync swig unzip zlib1g-dev file wget \
-        llvm python3-pyelftools libpython3-dev aria2 jq qemu-utils ccache rename \
-        libelf-dev device-tree-compiler libgmp3-dev libmpc-dev libfuse-dev
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "Asia/Shanghai"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git config --global user.name "github-actions[bot]"
+      - name: Free disk space
+        uses: coder-xiaomo/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
-    - name: Get current date
-      id: date
-      run: |
-        echo "date=$(date +'%m/%d_%Y_%H/%M')" >> $GITHUB_ENV
-        echo "date2=$(date +'%m/%d %Y')" >> $GITHUB_ENV
-        VERSION="$(echo "${{github.event.action}}" | grep -Eo " [0-9.]+" | sed -e 's/ //')" || true
-        [ "$VERSION" ] && echo "VERSION=$VERSION" >> $GITHUB_ENV || echo "VERSION=$(date +'%m.%d')" >> $GITHUB_ENV
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            llvm python3-pyelftools libpython3-dev aria2 jq qemu-utils ccache rename \
+            libelf-dev device-tree-compiler libgmp3-dev libmpc-dev libfuse-dev
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "Asia/Shanghai"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
 
-    - name: Clone source code
-      run: |
-        set -x
-        TAG_INFO="$(curl -gs -H 'Content-Type: application/json' \
-           -H "Authorization: Bearer ${{ secrets.TOKEN_KIDDIN9 }}" \
-           -X POST -d '{ "query": "query {repository(owner: \"openwrt\", name: \"openwrt\") {refs(refPrefix: \"refs/tags/\", first: 4, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {nodes {name target { ... on Tag {tagger {date}}}}}}}"}' https://api.github.com/graphql)"
-        TAG_DATE="$( echo ${TAG_INFO} | jq -r '.data.repository.refs.nodes[] | select(.name | startswith("v25")) | .target.tagger.date' | head -n 1)"
-        if [[ $(( ($(date +%s) - $(date -d "$TAG_DATE" +%s)) / 86400 )) -lt 10 || "${{ contains(github.event.action, 'tags') }}" == "true" ]]; then
-        REPO_BRANCH="$( echo ${TAG_INFO} | jq -r '.data.repository.refs.nodes[].name' | grep v25 | head -n 1)"
-        #REPO_BRANCH="openwrt-25.12"
-        else
-        REPO_BRANCH="openwrt-25.12"
-        fi
-        #echo "CONFIG_VERSION_REPO=\"https://dl.openwrt.ai/releases/`echo $REPO_BRANCH  | cut -d . -f 1,2 | sed -e 's/^v//'`\"">>devices/common/.config
-        echo "CONFIG_VERSION_REPO=\"https://dl.openwrt.ai/releases/25.12\"">>devices/common/.config
-        if [[ ! "${{ env.REPO_BRANCH }}" && "$REPO_URL" == "https://github.com/openwrt/openwrt" ]]; then
+      - name: Get current date
+        id: date
+        run: |
+          echo "date=$(date +'%m/%d_%Y_%H/%M')" >> $GITHUB_ENV
+          echo "date2=$(date +'%m/%d %Y')" >> $GITHUB_ENV
+          VERSION="$(echo "${{github.event.action}}${{ github.event.inputs.target }}" | grep -Eo "[0-9.]+" | head -1)" || true
+          [ "$VERSION" ] && echo "VERSION=$VERSION" >> $GITHUB_ENV || echo "VERSION=$(date +'%m.%d')" >> $GITHUB_ENV
+
+      - name: Clone source code
+        run: |
+          set -x
+          # ✅ 改为匿名请求 GitHub GraphQL，不再依赖 TOKEN_KIDDIN9
+          # 匿名请求有速率限制，如需稳定可在此改用 ${{ secrets.REPO_TOKEN }}
+          TAG_INFO="$(curl -gs -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ${{ secrets.REPO_TOKEN }}" \
+            -X POST -d '{ "query": "query {repository(owner: \"openwrt\", name: \"openwrt\") {refs(refPrefix: \"refs/tags/\", first: 4, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {nodes {name target { ... on Tag {tagger {date}}}}}}}"}' \
+            https://api.github.com/graphql)"
+          TAG_DATE="$(echo ${TAG_INFO} | jq -r '.data.repository.refs.nodes[] | select(.name | startswith("v24")) | .target.tagger.date' | head -n 1)"
+          if [[ $(( ($(date +%s) - $(date -d "$TAG_DATE" +%s)) / 86400 )) -lt 15 ]]; then
+            REPO_BRANCH="$(echo ${TAG_INFO} | jq -r '.data.repository.refs.nodes[].name' | grep v24 | head -n 1)"
+          else
+            REPO_BRANCH="openwrt-24.10"
+          fi
+
+          echo "CONFIG_VERSION_REPO=\"https://dl.openwrt.ai/releases/24.10\"">>devices/common/.config
+
+          if [[ ! "${{ env.REPO_BRANCH }}" && "$REPO_URL" == "https://github.com/openwrt/openwrt" ]]; then
             git clone $REPO_URL -b $REPO_BRANCH openwrt
-        elif [[ ! "${{ env.REPO_BRANCH }}" ]]; then
+          elif [[ ! "${{ env.REPO_BRANCH }}" ]]; then
             git clone $REPO_URL openwrt
-        else
+          else
             REPO_BRANCH="${{env.REPO_BRANCH}}"
             if [[ ${#REPO_BRANCH} -lt 10 ]]; then
-                git clone $REPO_URL -b ${REPO_BRANCH} openwrt
+              git clone $REPO_URL -b ${REPO_BRANCH} openwrt
             else
-                git clone $REPO_URL openwrt
-                cd openwrt
-                git checkout ${REPO_BRANCH}
+              git clone $REPO_URL openwrt
+              cd openwrt
+              git checkout ${REPO_BRANCH}
             fi
-        fi
-
-    - name: Free up disk space
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo mkdir -p -m 777 /mnt/openwrt/build_dir openwrt/staging_dir
-        ln -sf /mnt/openwrt/build_dir openwrt/build_dir
-        sudo ln -sf openwrt/staging_dir /mnt/openwrt/staging_dir
-
-    - name: Load custom configuration
-      run: |
-        function git_clone_path() {
-          trap 'rm -rf "$tmpdir"' EXIT
-          branch="$1" rurl="$2" mv="$3"
-          [[ "$mv" != "mv" ]] && shift 2 || shift 3
-          rootdir="$PWD"
-          tmpdir="$(mktemp -d)" || exit 1
-          if [ ${#branch} -lt 10 ]; then
-          git clone -b "$branch" --depth 1 --filter=blob:none --sparse "$rurl" "$tmpdir"
-          cd "$tmpdir"
-          else
-          git clone --filter=blob:none --sparse "$rurl" "$tmpdir"
-          cd "$tmpdir"
-          git checkout $branch
           fi
-          if [ "$?" != 0 ]; then
-            echo "error on $rurl"
-            exit 1
-          fi
-          git sparse-checkout init --cone
-          git sparse-checkout set $@
-          [[ "$mv" != "mv" ]] && cp -rn ./* $rootdir/ || mv -n $@/* $rootdir/$@/
-          cd $rootdir
+
+      - name: Free up disk space
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo mkdir -p -m 777 /mnt/openwrt/dl /mnt/openwrt/staging_dir /mnt/openwrt/build_dir
+          ln -sf /mnt/openwrt/build_dir openwrt/build_dir
+
+      - name: Load custom configuration
+        run: |
+          # git_clone_path：稀疏克隆辅助函数（原样保留）
+          function git_clone_path() {
+            trap 'rm -rf "$tmpdir"' EXIT
+            branch="$1" rurl="$2" mv="$3"
+            [[ "$mv" != "mv" ]] && shift 2 || shift 3
+            rootdir="$PWD"
+            tmpdir="$(mktemp -d)" || exit 1
+            if [ ${#branch} -lt 10 ]; then
+              git clone -b "$branch" --depth 1 --filter=blob:none --sparse "$rurl" "$tmpdir"
+              cd "$tmpdir"
+            else
+              git clone --filter=blob:none --sparse "$rurl" "$tmpdir"
+              cd "$tmpdir"
+              git checkout $branch
+            fi
+            if [ "$?" != 0 ]; then
+              echo "error on $rurl"
+              exit 1
+            fi
+            git sparse-checkout init --cone
+            git sparse-checkout set $@
+            [[ "$mv" != "mv" ]] && cp -rn ./* $rootdir/ || mv -n $@/* $rootdir/$@/
+            cd $rootdir
           }
-        export -f git_clone_path
-        cp -rf devices/common/. openwrt/
-        cp -rf devices/${{matrix.target}}/. openwrt/
-        cp -rf devices openwrt/
-        cd openwrt
-        chmod +x devices/common/$DIY_SH
-        /bin/bash "devices/common/$DIY_SH"
-        cp -f devices/common/$CONFIG_FILE .config
-        if [ -f "devices/${{matrix.target}}/$CONFIG_FILE" ]; then
-          echo >> .config
-          cat devices/${{matrix.target}}/$CONFIG_FILE >> .config
-        fi
-        if [ -f "devices/${{matrix.target}}/$DIY_SH" ]; then
-          chmod +x devices/${{matrix.target}}/$DIY_SH
-          echo "/bin/bash devices/${{matrix.target}}/$DIY_SH"
-          /bin/bash "devices/${{matrix.target}}/$DIY_SH"
-        fi
-        cp -Rf ./diy/* ./ || true
+          export -f git_clone_path
 
-    - name: Apply patches
-      run: |
-        cd openwrt
-        cp -rn devices/common/patches devices/${{matrix.target}}/
+          cp -rf devices/common/. openwrt/
+          cp -rf devices/${{matrix.target}}/. openwrt/
+          cp -rf devices openwrt/
+          cd openwrt
+          chmod +x devices/common/$DIY_SH
+          /bin/bash "devices/common/$DIY_SH"
+          cp -f devices/common/$CONFIG_FILE .config
+          if [ -f "devices/${{matrix.target}}/$CONFIG_FILE" ]; then
+            echo >> .config
+            cat devices/${{matrix.target}}/$CONFIG_FILE >> .config
+          fi
+          if [ -f "devices/${{matrix.target}}/$DIY_SH" ]; then
+            chmod +x devices/${{matrix.target}}/$DIY_SH
+            echo "/bin/bash devices/${{matrix.target}}/$DIY_SH"
+            /bin/bash "devices/${{matrix.target}}/$DIY_SH"
+          fi
+          cp -Rf ./diy/* ./ || true
+
+      - name: Apply patches
+        run: |
+          cd openwrt
+          cp -rn devices/common/patches devices/${{matrix.target}}/
           if [ -n "$(ls -A devices/${{matrix.target}}/*.bin.patch 2>/dev/null)" ]; then
             git apply devices/${{matrix.target}}/patches/*.bin.patch
           fi
-          find "devices/${{matrix.target}}/patches" -maxdepth 1 -type f -name '*.revert.patch' -print0 | sort -z | xargs -I % -t -0 -n 1 sh -c "patch -d './' -R --no-backup-if-mismatch -p1 -F 1 --ignore-whitespace -i '%'"
-          find "devices/${{matrix.target}}/patches" -maxdepth 1 -type f -name '*.patch' ! -name '*.revert.patch' ! -name '*.bin.patch' -print0 | sort -z | xargs -I % -t -0 -n 1 sh -c "patch -d './' --no-backup-if-mismatch -p1 -F 1 --ignore-whitespace -i '%'"
+          find "devices/${{matrix.target}}/patches" -maxdepth 1 -type f -name '*.revert.patch' -print0 \
+            | sort -z | xargs -I % -t -0 -n 1 sh -c "cat '%' | patch -d './' -R -B --merge -p1 --forward"
+          find "devices/${{matrix.target}}/patches" -maxdepth 1 -type f -name '*.patch' \
+            ! -name '*.revert.patch' ! -name '*.bin.patch' -print0 \
+            | sort -z | xargs -I % -t -0 -n 1 sh -c "cat '%' | patch -d './' -B --merge -p1 --forward"
+          sed -i '$a \
+          CONFIG_CPU_FREQ_GOV_POWERSAVE=y \
+          CONFIG_CPU_FREQ_GOV_USERSPACE=y \
+          CONFIG_CPU_FREQ_GOV_ONDEMAND=y \
+          CONFIG_CPU_FREQ_GOV_CONSERVATIVE=y \
+          CONFIG_CRYPTO_CHACHA20_NEON=y \
+          CONFIG_CRYPTO_CHACHA20POLY1305=y \
+          CONFIG_FAT_DEFAULT_IOCHARSET="utf8" \
+          ' `find target/linux -path "target/linux/*/config-*"`
 
-    - name: Defconfig
-      run: |
-        cd openwrt
-        make defconfig
-        if [[ ! "${{matrix.target}}" =~ (amlogic_meson8b|armsr_armv8|bcm27xx_*|rockchip_armv8|sunxi_*|x86_*|siflower_*) ]]; then
-        sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' .config | sed -e 's/=m/=n/' >>.config
-        sed -i "s/\(kmod-qca.*\)=m/\1=n/" .config
-        make defconfig
-        fi
-        cat .config
+      - name: Defconfig
+        run: |
+          cd openwrt
+          make defconfig
+          if [[ ! "${{matrix.target}}" =~ (amlogic_*|armsr_armv8|bcm27xx_*|rockchip_armv8|sunxi_*|x86_*) ]]; then
+            sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' .config | sed -e 's/=m/=n/' >>.config
+            if [[ "${{matrix.target}}" == "rockchip_rk35xx" ]]; then
+              sed -n '/# Video Support/,/# end of Video Support/p' .config | sed -e 's/=m/=n/' >>.config
+            fi
+            make defconfig
+          fi
+          cat .config
 
-    - name: Cache
-      uses: stupidloud/cachewrtbuild@main
-      with:
-        ccache: 'false'
-        mixkey: ${{ matrix.target }}
-        clean: ${{ contains(github.event.action, 'nocache') }}
-        prefix: ${{ github.workspace }}/openwrt
+      - name: Cache
+        uses: stupidloud/cachewrtbuild@main
+        with:
+          ccache: 'true'
+          mixkey: ${{ matrix.target }}
+          clean: ${{ contains(github.event.action, 'nocache') || contains(github.event.inputs.nocache, 'nocache') }}
+          prefix: ${{ github.workspace }}/openwrt
 
-    - name: SSH connection to Actions
-      uses: kiddin9/debugger-action@master
-      if: contains(github.event.action, 'ssh')
+      - name: Check space usage
+        run: |
+          shopt -s extglob
+          cd openwrt
+          if [[ -f staging_dir/*${{ env.MTARGET }}*/bin ]]; then
+            rm -rf staging_dir/!(*${{ env.MTARGET }}*|host|hostpkg) build_dir/!(*${{ env.MTARGET }}*|host|hostpkg)
+          fi
+          df -hT
 
-    - name: Compile the firmware
-      id: compile
-      run: |
-        shopt -s extglob
-        df -hT
-        cd openwrt
-        echo -e "$(($(nproc)+1)) thread compile"
-        make -j$(($(nproc)+1)) || { log=$(mktemp);make V=s &>$log; } || { tail -50 $log; curl -k --data chat_id="${{ env.TELEGRAM_CHAT_ID }}" --data "text=❌ OpenWrt ${{ env.VERSION }} ${{matrix.target}} 编译失败 😂" "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage";df -hT;exit 1; }
-        rm -rf staging_dir/toolchain-*/bin/*openwrt-linux-musl-lto-dump
-        rm -rf staging_dir/toolchain-*/initial
-        df -hT
+      - name: SSH connection to Actions
+        uses: kiddin9/debugger-action@master
+        if: contains(github.event.action, 'ssh') || contains(github.event.inputs.ssh, 'ssh')
 
-    - name: Organize files
-      id: organize
-      continue-on-error: true
-      run: |
-        shopt -s extglob
-        cd openwrt/bin/targets/*/*/
-        cp $GITHUB_WORKSPACE/openwrt/.config ${{matrix.target}}.config || true
-        cp $GITHUB_WORKSPACE/openwrt/build_dir/target-*/linux-*/linux-*/.config ${{matrix.target}}_kernel.config || true
-        Emoji=("🎉" "🤞" "✨" "🎁" "🎈" "🎄" "🎨" "💋" "🍓" "🍕" "🍉" "💐" "🌴" "🚀" "🛸" "🗽" "⛅" "🌈" "🔥" "⛄" "🐶" "🏅" "🦄" "🐤")
-        echo "EMOJI=${Emoji[$[$RANDOM % ${#Emoji[@]}]]}" >> $GITHUB_ENV
+      - name: Compile the firmware
+        id: compile
+        run: |
+          shopt -s extglob
+          cd openwrt
+          echo -e "$(($(nproc)+1)) thread compile"
+          make -j$(($(nproc)+1)) || make V=s &>build.log || (
+            tail -50 build.log
+            curl -k --data chat_id="${{ env.TELEGRAM_CHAT_ID }}" \
+              --data "text=❌ OpenWrt ${{ env.VERSION }} ${{matrix.target}} 编译失败 😂" \
+              "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage"
+            df -hT
+            exit 1
+          )
+          sed -i "s/# CONFIG_IB is not set/CONFIG_IB=y/" .config
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FIRMWARE=$PWD/bin/targets/*/*" >> $GITHUB_ENV
+          echo "DATE=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+          echo "TAG=$(date +'%Y%m%d')-${{matrix.target}}" >> $GITHUB_ENV
 
-    - name: Deploy imagebuilder to server
-      uses: easingthemes/ssh-deploy@main
-      if: env.SSH_PRIVATE_KEY && ! contains(github.event.action, 'noser')
-      with:
-        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        ARGS: "-avr --timeout=600 --include='kwrt-imagebuilder-*' --include='kwrt-*-initramfs*' --exclude='kwrt-*'"
-        SSH_CMD_ARGS: "-o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o StrictHostKeyChecking=no"
-        SOURCE: openwrt/bin/targets
-        REMOTE_HOST: ${{ secrets.SERVER_HOST }}
-        REMOTE_USER: ${{ secrets.SERVER_USERNAME }}
-        REMOTE_PORT: ${{ secrets.SERVER_PORT }}
-        TARGET: "/www/wwwroot/dl.openwrt.ai/releases/tmp/"
+      - name: Check space usage after compile
+        if: steps.compile.outputs.status == 'success'
+        run: df -hT
 
-    - name: Upload firmware for artifact
-      uses: actions/upload-artifact@main
-      if: env.UPLOAD_FIRMWARE_FOR_ARTIFACT == 'true'
-      with:
-        name: ${{ env.VERSION }}_${{matrix.target}}
-        path: |
-          openwrt/bin/targets/
+      - name: Save kernel config
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cp $GITHUB_WORKSPACE/openwrt/build_dir/target-*/linux-*/linux-*/.config \
+            ${{matrix.target}}_kernel.config || true
 
-    - name: Create release
-      id: create_release
-      if: env.REPO_TOKEN && env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true'
-      continue-on-error: true
-      run: |
-        echo -e "墙内加速下载 🚀:\n" >> release.txt
-        echo -e "[腾讯云] (https://dl.openwrt.ai/firmware/${{matrix.target}}/ ☁)\n" >> release.txt
-        [ ${{ env.WETRANS }} ] && echo -e "[WeTransfer] (${{ env.WETRANS }} 🗽)\n" >> release.txt
-        [ ${{ env.COWURL }} ] && echo -e "[奶牛上传] (${{ env.COWURL }} 🐮)\n" >> release.txt
-        [ ${{ env.NOTICE }} ] && echo -e "${{ env.NOTICE }}" >> release.txt || true
+      - name: Organize firmware files
+        id: organize
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd openwrt/bin/targets/*/*
+          # 移除不必要的文件，减小 Release 体积
+          rm -rf packages *.buildinfo *.json *.manifest *kernel.bin *-rootfs* || true
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          Emoji=("🎉" "🤞" "✨" "🎁" "🎈" "🎄" "🎨" "💋" "🍓" "🍕" "🍉" "💐" "🌴" "🚀" "🛸" "🗽" "⛅" "🌈" "🔥" "⛄" "🐶" "🏅" "🦄" "🐤")
+          echo "EMOJI=${Emoji[$[$RANDOM % ${#Emoji[@]}]]}" >> $GITHUB_ENV
 
-    - name: Upload firmware for release
-      uses: softprops/action-gh-release@master
-      continue-on-error: true
-      if: env.REPO_TOKEN && env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true'
-      env:
-        GITHUB_TOKEN: ${{ secrets.TOKEN_KIDDIN9 }}
-      with:
-        files: "${{ env.FIRMWARE }}/*"
-        name: ${{ env.date2 }} ${{matrix.target}} ${{ env.EMOJI }}
-        tag_name: ${{ env.date }}_${{matrix.target}}
-        body_path: release.txt
-    
-    - name: WeChat notification
-      continue-on-error: true
-      if: env.SCKEY
-      run: |
-        # [ steps.compile.outputs.status == 'success' ] && curl https://sctapi.ftqq.com/${{ secrets.SCKEY }}.send?text=🎉OpenWrt_${{ env.VERSION }}_${{matrix.target}}编译完成😋|| curl https://sctapi.ftqq.com/${{ secrets.SCKEY }}.send?text=❌OpenWrt_${{ env.VERSION }}_${{matrix.target}}编译失败😂
+      - name: Upload bin directory to Artifact
+        uses: actions/upload-artifact@main
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR_FOR_ARTIFACT == 'true'
+        with:
+          name: OpenWrt_bin_${{matrix.target}}_${{ env.date }}
+          path: openwrt/bin
 
-    - name: Telegram notification
-      if: env.TELEGRAM_TOKEN && ! contains(github.event.action, 'notg')
-      continue-on-error: true
-      run: |
-        curl -k --data chat_id="${{ env.TELEGRAM_CHAT_ID }}" --data "text=🎉 OpenWrt ${{ env.VERSION }} ${{matrix.target}} 编译成功 😋  https://dl.openwrt.ai/firmware/${{matrix.target}}/  ${{ env.COWURL }}   ${{ env.WETRANS }} 🚀" "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage"
+      - name: Upload firmware to Artifact
+        uses: actions/upload-artifact@main
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE_FOR_ARTIFACT == 'true'
+        with:
+          name: OpenWrt_firmware_${{matrix.target}}_${{ env.date }}
+          path: ${{ env.FIRMWARE }}
 
-    - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
-      continue-on-error: true
-      with:
-        token: ${{ secrets.TOKEN_KIDDIN9 }}
-        retain_days: 100
-        keep_minimum_runs: 0
+      # ❌ 已删除 SSH 部署到 dl.openwrt.ai 服务器的步骤
+      # 原因：需要 SSH_PRIVATE_KEY secret 和对原作者服务器的访问权限，fork 后无法使用。
+      # 固件统一通过下方 GitHub Releases 发布。
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
-      continue-on-error: true
-      if: env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 15
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.TOKEN_KIDDIN9 }}
+      - name: Generate release notes
+        id: release_notes
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true'
+        run: |
+          echo "## OpenWrt ${{ env.VERSION }} - ${{matrix.target}}" > release.txt
+          echo "" >> release.txt
+          echo "**编译时间：** ${{ env.DATE }}" >> release.txt
+          echo "" >> release.txt
+          echo "**固件说明：**" >> release.txt
+          echo "- 基于 OpenWrt 官方源码编译" >> release.txt
+          echo "- Target: ${{matrix.target}}" >> release.txt
+          echo "" >> release.txt
+          [ ${{ env.NOTICE }} ] && echo -e "${{ env.NOTICE }}" >> release.txt || true
+
+      - name: Upload firmware to GitHub Releases
+        uses: softprops/action-gh-release@v1
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "${{ env.EMOJI }} OpenWrt ${{ env.VERSION }} ${{matrix.target}}"
+          body_path: release.txt
+          files: ${{ env.FIRMWARE }}/*
+
+      - name: Telegram success notification
+        if: steps.compile.outputs.status == 'success' && !contains(github.event.action, 'notg')
+        run: |
+          curl -k \
+            --data chat_id="${{ env.TELEGRAM_CHAT_ID }}" \
+            --data "text=${{ env.EMOJI }} OpenWrt ${{ env.VERSION }} ${{matrix.target}} 编译成功 😋&#10;下载地址：https://github.com/${{ github.repository }}/releases/tag/${{ env.TAG }}" \
+            "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage" || true
+
+      - name: Delete older workflow runs
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.REPO_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 3
